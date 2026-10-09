@@ -1,0 +1,11 @@
+name = "multiplayer"
+main = "index.js"
+compatibility_date = "2026-10-09"
+
+[[durable_objects.bindings]]
+name = "ROOM"
+class_name = "Room"
+
+[exports.Room]
+type = "durable-object"
+storage = "sqlite"
