@@ -164,7 +164,7 @@ export class Room {
           inviteCode,
           key,
           timeoutMilliseconds: null,
-          censoredNickname: null
+          censoredNickname: typeof data.nickname === "string" ? data.nickname : "Anonymous"
         });
         return;
       }
