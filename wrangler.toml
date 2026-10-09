@@ -1,3 +1,4 @@
+
 name = "multiplayer"
 main = "index.js"
 compatibility_date = "2026-10-09"
@@ -9,4 +10,3 @@ class_name = "Room"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["Room"]
-toml     # Trigger a fresh deployment with the current Worker configuration
