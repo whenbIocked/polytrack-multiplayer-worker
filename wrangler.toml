@@ -7,6 +7,6 @@ compatibility_date = "2026-10-09"
 name = "ROOM"
 class_name = "Room"
 
-[[migrations]]
-tag = "v1"
-new_sqlite_classes = ["Room"]
+[exports.Room]
+type = "durable-object"
+storage = "sqlite"
