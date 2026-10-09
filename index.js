@@ -5,12 +5,13 @@ const VERSION = "0.6.3";
 const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
 const CORS_HEADERS = {
   "access-control-allow-origin": "*",
-  "access-control-allow-methods": "GET,POST,OPTIONS",
+  "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
   "access-control-allow-headers": "content-type",
   "cache-control": "no-store"
 };
 const SIGNALING_ROOM = "polytrack-0.6.3-signaling";
 const LEADERBOARD_ROOM = "polytrack-community-leaderboard-v1";
+const COMMUNITY_TRACKS_ROOM = "polytrack-community-tracks-v1";
 
 function json(data, status = 200) {
   return Response.json(data, { status, headers: CORS_HEADERS });
@@ -35,6 +36,13 @@ export default {
     if (url.pathname === "/api/public-lobbies" && ["GET", "POST"].includes(request.method)) {
       if (!env.ROOM) return json({ error: "Missing Durable Object binding ROOM" }, 500);
       const id = env.ROOM.idFromName(SIGNALING_ROOM);
+      return env.ROOM.get(id).fetch(request);
+    }
+
+    if ((url.pathname === "/api/community-tracks" || url.pathname.startsWith("/api/community-tracks/")) &&
+        ["GET", "POST", "DELETE"].includes(request.method)) {
+      if (!env.ROOM) return json({ error: "Missing Durable Object binding ROOM" }, 500);
+      const id = env.ROOM.idFromName(COMMUNITY_TRACKS_ROOM);
       return env.ROOM.get(id).fetch(request);
     }
 
@@ -63,7 +71,7 @@ export default {
 
     return json({
       error: "Not found",
-      supported: ["/api/health", "/api/public-lobbies", "/v6/iceServers", "/v6/multiplayer/host", "/v6/multiplayer/join"]
+      supported: ["/api/health", "/api/public-lobbies", "/api/community-tracks", "/v6/iceServers", "/v6/multiplayer/host", "/v6/multiplayer/join"]
     }, 404);
   }
 };
@@ -75,6 +83,10 @@ export class Room {
 
   async fetch(request) {
     const url = new URL(request.url);
+
+    if (url.pathname === "/api/community-tracks" || url.pathname.startsWith("/api/community-tracks/")) {
+      return this.handleCommunityTracksApi(request, url);
+    }
 
     // HTTP API calls are routed to a separate Durable Object instance, distinct
     // from the live multiplayer signaling room.
@@ -197,6 +209,100 @@ export class Room {
 
   sortEntries(entries) {
     return entries.sort((a, b) => a.frames - b.frames || Date.parse(a.time) - Date.parse(b.time) || a.id - b.id);
+  }
+
+  async handleCommunityTracksApi(request, url) {
+    const base = "/api/community-tracks";
+    const tail = url.pathname.slice(base.length).replace(/^\/+|\/+$/g, "");
+    const clean = (value, max) => String(value ?? "")
+      .replace(/[<>\u0000-\u001f\u007f]/g, "")
+      .trim()
+      .slice(0, max);
+
+    if (!tail && request.method === "GET") {
+      const ownerToken = url.searchParams.get("ownerToken") || "";
+      const ownerHash = ownerToken ? await this.sha256Hex(ownerToken) : "";
+      const stored = await this.state.storage.list({ prefix: "ct:track:" });
+      const tracks = [...stored.values()]
+        .filter(item => item && typeof item === "object" && typeof item.id === "string")
+        .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+        .map(item => ({
+          id: item.id,
+          name: item.name,
+          author: item.author,
+          createdAt: item.createdAt,
+          bytes: item.bytes,
+          downloads: item.downloads || 0,
+          isOwner: !!ownerHash && item.ownerHash === ownerHash
+        }));
+      return json({ ok: true, tracks });
+    }
+
+    if (!tail && request.method === "POST") {
+      const raw = await request.text();
+      if (raw.length > 800000) return json({ error: "Track upload is too large (max 800 KB)" }, 413);
+      let body;
+      try { body = JSON.parse(raw); } catch { return json({ error: "Invalid JSON body" }, 400); }
+      const name = clean(body.name, 48);
+      const author = clean(body.author || "Anonymous", 32) || "Anonymous";
+      const code = typeof body.code === "string" ? body.code.trim() : "";
+      const ownerToken = typeof body.ownerToken === "string" ? body.ownerToken : "";
+      if (!name) return json({ error: "Track name is required" }, 400);
+      if (!code) return json({ error: "Track export code is required" }, 400);
+      if (code.length > 700000) return json({ error: "Track code is too large (max 700 KB)" }, 413);
+      if (ownerToken.length < 8 || ownerToken.length > 256) return json({ error: "Invalid owner token" }, 400);
+
+      const all = await this.state.storage.list({ prefix: "ct:track:" });
+      if (all.size >= 500) return json({ error: "Community track storage is full for now" }, 507);
+      const ownerHash = await this.sha256Hex(ownerToken);
+      const ownedCount = [...all.values()].filter(item => item && item.ownerHash === ownerHash).length;
+      if (ownedCount >= 20) return json({ error: "Limit is 20 published tracks per browser profile" }, 429);
+
+      const id = crypto.randomUUID().replaceAll("-", "");
+      const track = {
+        id,
+        name,
+        author,
+        code,
+        ownerHash,
+        createdAt: Date.now(),
+        bytes: new TextEncoder().encode(code).length,
+        downloads: 0
+      };
+      await this.state.storage.put(`ct:track:${id}`, track);
+      return json({ ok: true, track: { id, name, author, createdAt: track.createdAt, bytes: track.bytes, downloads: 0, isOwner: true } }, 201);
+    }
+
+    if (tail) {
+      const id = tail.split("/")[0];
+      if (!/^[a-zA-Z0-9-]{8,80}$/.test(id)) return json({ error: "Invalid track id" }, 400);
+      const key = `ct:track:${id}`;
+      const track = await this.state.storage.get(key);
+      if (!track) return json({ error: "Community track not found" }, 404);
+
+      if (request.method === "GET") {
+        track.downloads = (track.downloads || 0) + 1;
+        await this.state.storage.put(key, track);
+        return json({ ok: true, track: {
+          id: track.id, name: track.name, author: track.author,
+          createdAt: track.createdAt, bytes: track.bytes,
+          downloads: track.downloads, code: track.code
+        }});
+      }
+
+      if (request.method === "DELETE") {
+        let body;
+        try { body = await request.json(); } catch { return json({ error: "Invalid JSON body" }, 400); }
+        const ownerToken = typeof body.ownerToken === "string" ? body.ownerToken : "";
+        if (!ownerToken) return json({ error: "Owner token required" }, 401);
+        const ownerHash = await this.sha256Hex(ownerToken);
+        if (!track.ownerHash || track.ownerHash !== ownerHash) return json({ error: "Only the uploader can delete this track" }, 403);
+        await this.state.storage.delete(key);
+        return json({ ok: true, deleted: id });
+      }
+    }
+
+    return json({ error: "Method not allowed" }, 405);
   }
 
   async handleLeaderboardApi(request, url) {
