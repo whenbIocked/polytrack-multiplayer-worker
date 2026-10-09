@@ -10,6 +10,7 @@ const CORS_HEADERS = {
   "cache-control": "no-store"
 };
 const SIGNALING_ROOM = "polytrack-0.6.3-signaling";
+const LEADERBOARD_ROOM = "polytrack-community-leaderboard-v1";
 
 function json(data, status = 200) {
   return Response.json(data, { status, headers: CORS_HEADERS });
@@ -24,7 +25,7 @@ export default {
     }
 
     if (url.pathname === "/api/health") {
-      return json({ ok: true, service: "polytrack-0.6.3-signaling-public-lobbies" });
+      return json({ ok: true, service: "polytrack-community-leaderboard" });
     }
 
     if (url.pathname === "/v6/iceServers" && request.method === "GET") {
@@ -34,6 +35,17 @@ export default {
     if (url.pathname === "/api/public-lobbies" && ["GET", "POST"].includes(request.method)) {
       if (!env.ROOM) return json({ error: "Missing Durable Object binding ROOM" }, 500);
       const id = env.ROOM.idFromName(SIGNALING_ROOM);
+      return env.ROOM.get(id).fetch(request);
+    }
+
+    const leaderboardRoutes =
+      url.pathname.startsWith("/v6/leaderboard") ||
+      ["/v6/recordings", "/v6/user", "/v6/verifyRecordings", "/v6/trackOfTheWeek"].includes(url.pathname) ||
+      url.pathname.startsWith("/v6/admin/");
+
+    if (leaderboardRoutes) {
+      if (!env.ROOM) return json({ error: "Missing Durable Object binding ROOM" }, 500);
+      const id = env.ROOM.idFromName(LEADERBOARD_ROOM);
       return env.ROOM.get(id).fetch(request);
     }
 
@@ -63,6 +75,13 @@ export class Room {
 
   async fetch(request) {
     const url = new URL(request.url);
+
+    // HTTP API calls are routed to a separate Durable Object instance, distinct
+    // from the live multiplayer signaling room.
+    if (url.pathname.startsWith("/v6/") &&
+        (request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") {
+      return this.handleLeaderboardApi(request, url);
+    }
 
     // Live public lobby directory. Entries only exist while their host socket is online.
     if (url.pathname === "/api/public-lobbies" && request.method === "GET") {
@@ -154,6 +173,209 @@ export class Room {
     });
     this.state.acceptWebSocket(server);
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  async sha256Hex(value) {
+    const bytes = new TextEncoder().encode(value);
+    const digest = await crypto.subtle.digest("SHA-256", bytes);
+    return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  trackKey(trackId) {
+    return Array.from(new TextEncoder().encode(String(trackId)), b => b.toString(16).padStart(2, "0")).join("").slice(0, 240) || "empty";
+  }
+
+  cleanNickname(value) {
+    const cleaned = String(value ?? "Anonymous").replace(/[<>\u0000-\u001f\u007f]/g, "").trim().slice(0, 50);
+    return cleaned || "Anonymous";
+  }
+
+  async listTrackEntries(trackKey) {
+    const stored = await this.state.storage.list({ prefix: `lb:entry:${trackKey}:` });
+    return [...stored.values()].filter(v => v && typeof v === "object");
+  }
+
+  sortEntries(entries) {
+    return entries.sort((a, b) => a.frames - b.frames || Date.parse(a.time) - Date.parse(b.time) || a.id - b.id);
+  }
+
+  async handleLeaderboardApi(request, url) {
+    const path = url.pathname;
+
+    if (path === "/v6/leaderboard" && request.method === "GET") {
+      const trackId = url.searchParams.get("trackId") || "";
+      const trackKey = this.trackKey(trackId);
+      const skip = Math.max(0, Math.min(1000000, Number.parseInt(url.searchParams.get("skip") || "0", 10) || 0));
+      const amount = Math.max(1, Math.min(50, Number.parseInt(url.searchParams.get("amount") || "20", 10) || 20));
+      const onlyVerified = url.searchParams.get("onlyVerified") === "true";
+      const userTokenHash = url.searchParams.get("userTokenHash") || "";
+      let entries = this.sortEntries(await this.listTrackEntries(trackKey));
+      if (onlyVerified) entries = entries.filter(entry => entry.verifiedState === 1);
+      const total = entries.length;
+      const page = entries.slice(skip, skip + amount).map(entry => ({
+        id: entry.id,
+        userId: entry.userId,
+        nickname: entry.nickname,
+        countryCode: entry.countryCode,
+        frames: entry.frames,
+        time: entry.time,
+        carStyle: entry.carStyle,
+        verifiedState: entry.verifiedState
+      }));
+      let userEntry = null;
+      if (userTokenHash) {
+        const index = entries.findIndex(entry => entry.userId === userTokenHash);
+        if (index >= 0) {
+          const entry = entries[index];
+          userEntry = { position: index + 1, frames: entry.frames, id: entry.id };
+        }
+      }
+      return json({ total, entries: page, userEntry });
+    }
+
+    if (path === "/v6/leaderboardUserEntry" && request.method === "GET") {
+      // The game uses this endpoint when syncing a local record from the official
+      // leaderboard. Community records are intentionally unverified, so onlyVerified=true
+      // returns null rather than pretending that community runs are verified.
+      if (url.searchParams.get("onlyVerified") === "true") return json(null);
+      const trackKey = this.trackKey(url.searchParams.get("trackId") || "");
+      const userHash = url.searchParams.get("userTokenHash") || "";
+      const entries = this.sortEntries(await this.listTrackEntries(trackKey));
+      const index = entries.findIndex(entry => entry.userId === userHash);
+      if (index < 0) return json(null);
+      const entry = entries[index];
+      return json({ position: index + 1, frames: entry.frames, id: entry.id });
+    }
+
+    if (path === "/v6/leaderboard" && request.method === "POST") {
+      const bodyText = await request.text();
+      if (bodyText.length > 300000) return json({ error: "Submission too large" }, 413);
+      const form = new URLSearchParams(bodyText);
+      const token = form.get("userToken") || "";
+      const nickname = this.cleanNickname(form.get("nickname"));
+      const rawCountry = (form.get("countryCode") || "").toUpperCase();
+      const countryCode = /^[A-Z]{2}$/.test(rawCountry) ? rawCountry : null;
+      const carStyle = form.get("carStyle") || "";
+      const trackId = form.get("trackId") || "";
+      const frames = Number(form.get("frames"));
+      const recording = form.get("recording") || "";
+      if (!token || token.length > 512 || !trackId || trackId.length > 500 || !carStyle || carStyle.length > 30000 ||
+          !Number.isSafeInteger(frames) || frames < 1 || frames > 5999999 || recording.length < 1 || recording.length >= 10000) {
+        return json({ error: "Invalid leaderboard submission" }, 400);
+      }
+
+      const userId = await this.sha256Hex(token);
+      const trackKey = this.trackKey(trackId);
+      const userKey = `lb:user:${trackKey}:${userId}`;
+      const oldId = await this.state.storage.get(userKey);
+      const oldEntry = Number.isSafeInteger(oldId) ? await this.state.storage.get(`lb:entry:${trackKey}:${oldId}`) : null;
+      let entriesBefore = this.sortEntries(await this.listTrackEntries(trackKey));
+      const previousIndex = entriesBefore.findIndex(entry => entry.userId === userId);
+      const previousPosition = previousIndex < 0 ? 0 : previousIndex + 1;
+
+      // Keep each player's best time for each track. Worse re-submissions do not
+      // overwrite a better result already on the community board.
+      if (oldEntry && oldEntry.frames <= frames) {
+        return json({ uploadId: oldEntry.id, previousPosition, newPosition: previousPosition });
+      }
+
+      let id = (await this.state.storage.get("lb:next-id")) || 1;
+      if (!Number.isSafeInteger(id) || id < 1) id = 1;
+      await this.state.storage.put("lb:next-id", id + 1);
+
+      if (oldEntry) {
+        await this.state.storage.delete(`lb:entry:${trackKey}:${oldEntry.id}`);
+        await this.state.storage.delete(`lb:recording:${oldEntry.id}`);
+      }
+
+      const entry = {
+        id,
+        userId,
+        nickname,
+        countryCode,
+        frames,
+        time: new Date().toISOString(),
+        carStyle,
+        // 0 == Pending in PolyTrack's UI. Community scores are not officially verified.
+        verifiedState: 0
+      };
+      await this.state.storage.put(`lb:entry:${trackKey}:${id}`, entry);
+      await this.state.storage.put(`lb:recording:${id}`, {
+        recording,
+        verifiedState: 0,
+        frames,
+        carStyle
+      });
+      await this.state.storage.put(userKey, id);
+
+      let entriesAfter = this.sortEntries(await this.listTrackEntries(trackKey));
+      // Keep at most 500 community records per track to bound storage growth.
+      for (const stale of entriesAfter.slice(500)) {
+        await this.state.storage.delete(`lb:entry:${trackKey}:${stale.id}`);
+        await this.state.storage.delete(`lb:recording:${stale.id}`);
+        const staleUserKey = `lb:user:${trackKey}:${stale.userId}`;
+        if (await this.state.storage.get(staleUserKey) === stale.id) {
+          await this.state.storage.delete(staleUserKey);
+        }
+      }
+      entriesAfter = entriesAfter.slice(0, 500);
+      const newPosition = Math.max(0, entriesAfter.findIndex(entry => entry.id === id) + 1);
+      return json({ uploadId: id, previousPosition, newPosition });
+    }
+
+    if (path === "/v6/user" && request.method === "GET") {
+      const token = url.searchParams.get("userToken") || "";
+      if (!token) return json(null);
+      const hash = await this.sha256Hex(token);
+      const profile = await this.state.storage.get(`lb:profile:${hash}`);
+      return json(profile || null);
+    }
+
+    if (path === "/v6/user" && request.method === "POST") {
+      const bodyText = await request.text();
+      if (bodyText.length > 50000) return json({ error: "Profile too large" }, 413);
+      const form = new URLSearchParams(bodyText);
+      const token = form.get("userToken") || "";
+      if (!token || token.length > 512) return json({ error: "Invalid user token" }, 400);
+      const hash = await this.sha256Hex(token);
+      const rawCountry = (form.get("countryCode") || "").toUpperCase();
+      const profile = {
+        nickname: this.cleanNickname(form.get("nickname")),
+        countryCode: /^[A-Z]{2}$/.test(rawCountry) ? rawCountry : null,
+        carStyle: form.get("carStyle") || "",
+        isVerifier: false
+      };
+      await this.state.storage.put(`lb:profile:${hash}`, profile);
+      return new Response("", { status: 200, headers: CORS_HEADERS });
+    }
+
+    if (path === "/v6/recordings" && request.method === "GET") {
+      const ids = (url.searchParams.get("ids") || "").split(",").filter(Boolean).slice(0, 100).map(Number);
+      const records = [];
+      for (const id of ids) {
+        if (!Number.isSafeInteger(id) || id < 1) { records.push(null); continue; }
+        records.push(await this.state.storage.get(`lb:recording:${id}`) || null);
+      }
+      return json(records);
+    }
+
+    if (path === "/v6/verifyRecordings" && request.method === "POST") {
+      // Custom scores are not verified by PolyTrack's official verification service.
+      return json({ unverifiedRecordings: [], exhaustive: true, estimatedRemaining: 0 });
+    }
+
+    if (path === "/v6/trackOfTheWeek" && request.method === "GET") {
+      return json({ serverTime: new Date().toISOString(), current: null });
+    }
+
+    if (path === "/v6/admin/trackOfTheWeekList" && request.method === "GET") {
+      return json({ currentEpoch: 0, list: [] });
+    }
+    if (path === "/v6/admin/trackOfTheWeek" && request.method === "POST") {
+      return json({ error: "Community Worker does not expose admin track publishing" }, 403);
+    }
+
+    return json({ error: "Unsupported community API endpoint", path }, 404);
   }
 
   getSockets() {
