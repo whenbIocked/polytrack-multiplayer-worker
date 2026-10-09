@@ -1,15 +1,12 @@
-// PolyTrack 0.6.3 signaling Worker.
-// This version uses the standard Durable Object WebSocket API (server.accept
-// + addEventListener) to avoid relying on the hibernation event callbacks.
-// PolyTrack's car sync remains its built-in WebRTC data channel.
-
+// PolyTrack 0.6.3 signaling Worker for Cloudflare Workers + one Durable Object.
+// The game still sends car states directly over PolyTrack's built-in WebRTC data channels.
 const VERSION = "0.6.3";
 const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
 const CORS_HEADERS = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET,POST,OPTIONS",
   "access-control-allow-headers": "content-type",
-  "cache-control": "no-store",
+  "cache-control": "no-store"
 };
 
 export default {
@@ -22,8 +19,8 @@ export default {
 
     if (url.pathname === "/api/health") {
       return Response.json(
-        { ok: true, service: "polytrack-0.6.3-signaling-standard-ws" },
-        { headers: CORS_HEADERS },
+        { ok: true, service: "polytrack-0.6.3-signaling-keyfix" },
+        { headers: CORS_HEADERS }
       );
     }
 
@@ -35,31 +32,33 @@ export default {
       url.pathname === "/v6/multiplayer/host" ||
       url.pathname === "/v6/multiplayer/join"
     ) {
-      if (request.method !== "GET" || (request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") {
-        return new Response("WebSocket upgrade required", { status: 426, headers: CORS_HEADERS });
+      if ((request.headers.get("Upgrade") || "").toLowerCase() !== "websocket") {
+        return new Response("WebSocket upgrade required", {
+          status: 426,
+          headers: CORS_HEADERS
+        });
       }
       if (!env.ROOM) {
-        console.error("ROOM Durable Object binding is missing");
-        return Response.json({ error: "Missing Durable Object binding ROOM" }, { status: 500, headers: CORS_HEADERS });
+        return Response.json(
+          { error: "Missing Durable Object binding ROOM" },
+          { status: 500, headers: CORS_HEADERS }
+        );
       }
+      // One signaling Durable Object lets hosts and joiners find each other by invite code.
       const id = env.ROOM.idFromName("polytrack-0.6.3-signaling");
       return env.ROOM.get(id).fetch(request);
     }
 
     return Response.json(
       { error: "Not found", supported: ["/api/health", "/v6/iceServers", "/v6/multiplayer/host", "/v6/multiplayer/join"] },
-      { status: 404, headers: CORS_HEADERS },
+      { status: 404, headers: CORS_HEADERS }
     );
-  },
+  }
 };
 
 export class Room {
-  constructor(state, env) {
+  constructor(state) {
     this.state = state;
-    this.env = env;
-    // Standard WebSocket API pins this DO while clients are connected, so this
-    // in-memory map stays available for the duration of active invite sessions.
-    this.connections = new Map();
   }
 
   async fetch(request) {
@@ -68,96 +67,104 @@ export class Room {
     const pair = new WebSocketPair();
     const client = pair[0];
     const server = pair[1];
-
-    server.accept();
-    this.connections.set(server, {
-      role,
-      id: crypto.randomUUID(),
-      inviteCode: null,
-      session: null,
-    });
-
-    console.log("WebSocket connected", { role, path: url.pathname });
-    server.addEventListener("message", (event) => {
-      this.handleMessage(server, event.data);
-    });
-    server.addEventListener("close", () => this.handleClose(server));
-    server.addEventListener("error", () => this.handleClose(server));
-
+    server.serializeAttachment({ role, id: crypto.randomUUID(), inviteCode: null, session: null });
+    this.state.acceptWebSocket(server);
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  attachment(socket) {
-    return this.connections.get(socket) || null;
+  getSockets() {
+    return this.state.getWebSockets();
+  }
+
+  getAttachment(socket) {
+    try {
+      return socket.deserializeAttachment() || {};
+    } catch {
+      return {};
+    }
+  }
+
+  saveAttachment(socket, attachment) {
+    try {
+      socket.serializeAttachment(attachment);
+    } catch {}
   }
 
   send(socket, data) {
+    if (!socket || socket.readyState !== 1) return false;
     try {
-      if (!socket || socket.readyState !== WebSocket.OPEN) return false;
       socket.send(JSON.stringify({ version: VERSION, ...data }));
       return true;
-    } catch (error) {
-      console.error("WebSocket send failed", String(error));
+    } catch {
       return false;
     }
   }
 
-  findHost(code) {
-    for (const [socket, client] of this.connections) {
-      if (client.role === "host" && client.inviteCode === code && socket.readyState === WebSocket.OPEN) return socket;
+  findHost(inviteCode) {
+    for (const socket of this.getSockets()) {
+      const attachment = this.getAttachment(socket);
+      if (attachment.role === "host" && attachment.inviteCode === inviteCode && socket.readyState === 1) {
+        return socket;
+      }
     }
     return null;
   }
 
   findJoiner(session) {
-    for (const [socket, client] of this.connections) {
-      if (client.role === "join" && client.session === session && socket.readyState === WebSocket.OPEN) return socket;
+    for (const socket of this.getSockets()) {
+      const attachment = this.getAttachment(socket);
+      if (attachment.role === "join" && attachment.session === session && socket.readyState === 1) {
+        return socket;
+      }
     }
     return null;
   }
 
   makeInviteCode() {
     for (let attempt = 0; attempt < 100; attempt++) {
-      const n = crypto.getRandomValues(new Uint32Array(1))[0] % 1000000;
-      const code = String(n).padStart(6, "0");
+      const number = crypto.getRandomValues(new Uint32Array(1))[0] % 1000000;
+      const code = String(number).padStart(6, "0");
       if (!this.findHost(code)) return code;
     }
     return String(Date.now() % 1000000).padStart(6, "0");
   }
 
-  handleMessage(socket, raw) {
-    if (typeof raw !== "string" || raw.length > 250000) {
+  webSocketMessage(socket, rawMessage) {
+    if (typeof rawMessage !== "string" || rawMessage.length > 250000) {
       try { socket.close(1009, "Invalid message size"); } catch {}
       return;
     }
 
     let data;
-    try { data = JSON.parse(raw); }
-    catch {
-      console.error("Invalid JSON received over WebSocket");
+    try {
+      data = JSON.parse(rawMessage);
+    } catch {
       try { socket.close(1007, "Invalid JSON"); } catch {}
       return;
     }
-    if (!data || typeof data !== "object" || Array.isArray(data) || typeof data.type !== "string") return;
+    if (!data || typeof data !== "object" || Array.isArray(data)) return;
 
-    const client = this.attachment(socket);
-    if (!client) return;
-    console.log("WebSocket message", { role: client.role, type: data.type });
-
-    if (client.role === "host") {
+    const attachment = this.getAttachment(socket);
+    if (attachment.role === "host") {
       if (data.type === "createInvite") {
-        if (typeof data.key !== "string") {
+        // PolyTrack 0.6.3 starts with key:null. Its client requires the
+        // server response to contain a STRING key, so issue one on first use
+        // and reuse it on subsequent renewals.
+        if (data.key !== null && typeof data.key !== "string") {
           this.send(socket, { type: "error", error: "MalformedClientData" });
           return;
         }
+        const key = typeof data.key === "string"
+          ? data.key
+          : crypto.randomUUID().replaceAll("-", "");
         const inviteCode = this.makeInviteCode();
-        client.inviteCode = inviteCode;
+        this.saveAttachment(socket, { ...attachment, inviteCode, key });
         this.send(socket, {
           type: "createInvite",
           inviteCode,
-          key: data.key,
+          key,
           timeoutMilliseconds: null,
-          censoredNickname: typeof data.nickname === "string" ? data.nickname : null,
+          censoredNickname: null
         });
         return;
       }
@@ -171,6 +178,7 @@ export class Room {
         const joiner = this.findJoiner(data.session);
         if (!joiner) return;
         if (data.type === "iceCandidate") {
+          // The join-side 0.6.3 client expects candidate without a session field.
           this.send(joiner, { type: "iceCandidate", candidate: data.candidate ?? null });
         } else {
           this.send(joiner, data);
@@ -179,9 +187,10 @@ export class Room {
       return;
     }
 
-    if (client.role !== "join") return;
+    if (attachment.role !== "join") return;
 
-    if (!client.session) {
+    // The join client starts with an offer packet; subsequent packets carry ICE candidates.
+    if (!attachment.session) {
       const inviteCode = typeof data.inviteCode === "string" ? data.inviteCode.trim().toUpperCase() : "";
       const host = inviteCode ? this.findHost(inviteCode) : null;
       if (!host) {
@@ -191,7 +200,6 @@ export class Room {
       }
       if (
         typeof data.offer !== "string" ||
-        typeof data.version !== "string" ||
         typeof data.nickname !== "string" ||
         typeof data.carStyle !== "string" ||
         !Array.isArray(data.mods) ||
@@ -201,49 +209,59 @@ export class Room {
         try { socket.close(1007, "Malformed join request"); } catch {}
         return;
       }
-
       const session = crypto.randomUUID();
-      client.inviteCode = inviteCode;
-      client.session = session;
-      const ok = this.send(host, {
+      this.saveAttachment(socket, { ...attachment, inviteCode, session });
+      const hostAccepted = this.send(host, {
         type: "joinInvite",
         session,
         offer: data.offer,
-        version: data.version,
+        version: typeof data.version === "string" ? data.version : VERSION,
         mods: data.mods,
         isModsVanillaCompatible: data.isModsVanillaCompatible,
         nickname: data.nickname.slice(0, 50),
         countryCode: typeof data.countryCode === "string" ? data.countryCode : null,
         carStyle: data.carStyle,
-        iceServers: ICE_SERVERS,
+        iceServers: ICE_SERVERS
       });
-      if (!ok) {
+      if (!hostAccepted) {
         this.send(socket, { type: "error", error: "ExpiredInvite" });
         try { socket.close(1011, "Host disconnected"); } catch {}
       }
       return;
     }
 
+    // Join-side ICE candidates have no type/session; the signaling server supplies both.
     if (Object.prototype.hasOwnProperty.call(data, "candidate")) {
-      const host = this.findHost(client.inviteCode);
-      if (host) this.send(host, { type: "iceCandidate", session: client.session, candidate: data.candidate ?? null });
+      const host = this.findHost(attachment.inviteCode);
+      if (host) {
+        this.send(host, {
+          type: "iceCandidate",
+          session: attachment.session,
+          candidate: data.candidate ?? null
+        });
+      }
     }
   }
 
-  handleClose(socket) {
-    const client = this.attachment(socket);
-    if (!client) return;
-    this.connections.delete(socket);
+  webSocketClose(socket) {
+    this.handleClosedSocket(socket);
+  }
 
-    if (client.role === "join" && client.session) {
-      const host = this.findHost(client.inviteCode);
-      if (host) this.send(host, { type: "joinDisconnect", session: client.session });
+  webSocketError(socket) {
+    this.handleClosedSocket(socket);
+  }
+
+  handleClosedSocket(socket) {
+    const attachment = this.getAttachment(socket);
+    if (attachment.role === "join" && attachment.session) {
+      const host = this.findHost(attachment.inviteCode);
+      if (host) this.send(host, { type: "joinDisconnect", session: attachment.session });
       return;
     }
-
-    if (client.role === "host" && client.inviteCode) {
-      for (const [other, otherClient] of this.connections) {
-        if (otherClient.role === "join" && otherClient.inviteCode === client.inviteCode) {
+    if (attachment.role === "host" && attachment.inviteCode) {
+      for (const other of this.getSockets()) {
+        const otherAttachment = this.getAttachment(other);
+        if (otherAttachment.role === "join" && otherAttachment.inviteCode === attachment.inviteCode) {
           this.send(other, { type: "error", error: "ExpiredInvite" });
           try { other.close(1000, "Host disconnected"); } catch {}
         }
